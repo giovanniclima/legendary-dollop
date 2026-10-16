@@ -1,0 +1,13 @@
+complexipy
+hypothesis
+mutmut
+pip-audit
+pylint
+pyright
+pytest-xdist
+pytest
+pytest-cov
+ruff
+semgrep
+tomlkit
+typer

@@ -1,0 +1,32 @@
+*.py[cod]
+__pycache__/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.DS_Store
+.claude
+.codex
+.vscode/
+docs/launch.md
+test-results/
+**/node_modules/
+dist/
+.tox/
+
+.env
+.env.*
+
+# in-repo worker worktrees (isolated agent workspaces, never /tmp)
+.worktrees/
+
+# scratchpad: ship the dir + agent doc, ignore everything agents/runs write into it
+scratchpad/*
+!scratchpad/README.md
+!scratchpad/runs/
+scratchpad/runs/*
+!scratchpad/runs/.gitkeep
+
+# mutmut's mutated copies of the source. Ignoring them is also what keeps ruff and semgrep out.
+mutants/

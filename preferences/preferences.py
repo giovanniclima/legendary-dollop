@@ -1,0 +1,451 @@
+"""AST-based structural style checks for staged Python files.
+
+OPTIONAL for humans to use or edit! The functions below are examples to use. Or delete.
+
+Agents in the loop cannot edit this file. It's in `FORBIDDEN_DIRS` at `harness/gate.py`.
+
+This module should reflect the repo owner's personal coding style hates. It's personal.
+e.g. indiscriminate __underscore_names, **star-unpacking, pointless classes, loops instead of Set math.
+
+Use this file ONLY for rules that ruff, pylint, and pyright cannot express but you want enforced. Keep short.
+"""
+
+from __future__ import annotations
+
+import ast
+from collections.abc import Callable
+
+# A check looks at ONE AST node and returns a complaint or None if the node is fine.
+# It never walks the tree. root preferences_violations does the walk and feeds nodes to functions.
+Check = Callable[[ast.AST], "str | None"]
+
+IDENTIFIER_VOWELS = frozenset("aeiouy")
+IDENTIFIER_INITIALISMS = frozenset({
+    "api",
+    "ast",
+    "cd",
+    "ci",
+    "cli",
+    "cpu",
+    "css",
+    "csv",
+    "db",
+    "dns",
+    "gpu",
+    "grpc",
+    "hsl",
+    "hsv",
+    "html",
+    "http",
+    "https",
+    "id",
+    "io",
+    "ip",
+    "json",
+    "jwt",
+    "llm",
+    "mcp",
+    "md",
+    "ml",
+    "npm",
+    "os",
+    "pr",
+    "rgb",
+    "rng",
+    "sdk",
+    "sha",
+    "sql",
+    "ssh",
+    "ssl",
+    "svn",
+    "tcp",
+    "tls",
+    "toml",
+    "tsv",
+    "ttl",
+    "udp",
+    "ui",
+    "uri",
+    "url",
+    "utc",
+    "uuid",
+    "xml",
+    "yaml",
+})
+
+
+def identifier_boundary(part: str, index: int) -> bool:
+    """Return whether an identifier chunk starts a new word at ``index``.
+
+    Args:
+        part: One underscore-delimited identifier chunk.
+        index: Character position to inspect; must be greater than zero.
+
+    Returns:
+        True when the position starts a digit run, word, or acronym boundary.
+    """
+    character = part[index]
+    previous = part[index - 1]
+    following = part[index + 1] if index + 1 < len(part) else ""
+    changes_digit_kind = character.isdigit() != previous.isdigit()
+    starts_camel_word = character.isupper() and previous.islower()
+    ends_acronym = character.isupper() and previous.isupper() and following.islower()
+    return changes_digit_kind or starts_camel_word or ends_acronym
+
+
+def identifier_words(name: str) -> list[tuple[str, bool]]:
+    """Split snake_case and CamelCase identifiers into words.
+
+    Args:
+        name: Identifier text to split.
+
+    Returns:
+        Lowercase words paired with whether the original chunk was an all-uppercase acronym.
+    """
+    words: list[tuple[str, bool]] = []
+    parts = (part for part in name.strip("_").split("_") if part)
+    for part in parts:
+        start = 0
+        for index in range(1, len(part)):
+            if not identifier_boundary(part, index):
+                continue
+            raw_word = part[start:index]
+            words.append((raw_word.lower(), raw_word.isupper() and len(raw_word) > 1))
+            start = index
+        raw_word = part[start:]
+        words.append((raw_word.lower(), raw_word.isupper() and len(raw_word) > 1))
+    return words
+
+
+def compressed_identifier_words(name: str) -> list[str]:
+    """Return only clearly compressed identifier words.
+
+    Args:
+        name: Function or class identifier to inspect.
+
+    Returns:
+        Compressed tokens, preferring false negatives to false positives.
+    """
+    long_words: list[str] = []
+    short_words: list[str] = []
+    for word, uppercase_chunk in identifier_words(name):
+        if not word.isalpha() or word in IDENTIFIER_INITIALISMS or uppercase_chunk:
+            continue
+        if any(character in IDENTIFIER_VOWELS for character in word):
+            continue
+        if len(word) >= 3:
+            long_words.append(word)
+        elif len(word) == 2:
+            short_words.append(word)
+    if long_words:
+        return long_words
+    if len(short_words) >= 2:
+        return short_words
+    return []
+
+
+def abbreviated_name(node: ast.AST) -> str | None:
+    """Flag clearly compressed function and class names.
+
+    The heuristic checks function, async-function, and class identifiers only. It treats ``y`` as a vowel,
+    preserves common technical initialisms, and leaves unknown all-uppercase acronym chunks alone.
+
+    Args:
+        node: AST node to inspect.
+
+    Returns:
+        A readable complaint for compressed identifiers, otherwise None.
+    """
+    if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+        return None
+    compressed_words = compressed_identifier_words(node.name)
+    if not compressed_words:
+        return None
+    return f"'{node.name}': spell out compressed identifier token(s): {', '.join(compressed_words)}"
+
+
+def is_in_class(node: ast.AST) -> bool:
+    """Checks if ode is inside a class
+
+    Args:
+        node: The node in question to check, is it in a class?
+
+    Returns:
+        bool True is in class, else False
+    """
+    current = getattr(node, "parent", None)
+    while current:
+        if isinstance(current, ast.ClassDef):
+            return True
+        current = getattr(current, "parent", None)
+    return False
+
+
+def chaotic_continue_statements(node: ast.AST) -> str | None:
+    """Catch continue statements that are hard to follow: inside a while loop, or buried two or more
+    if/for blocks deep. A single `if` guard directly inside a loop is fine -- that is normal Python.
+
+    Example:
+        for x in xs:              -> fine: a plain continue in its loop
+            continue
+        for x in xs:              -> flagged: two `if` blocks deep
+            if a:
+                if b:
+                    continue
+        for x in xs:              -> flagged: nested loops
+            for y in ys:
+                continue
+        while cond:               -> flagged: any continue in a while loop (freeze risk)
+            continue
+
+    Args:
+        node: One piece of the parsed code to look at.
+
+    Returns:
+        A short message if the continue is in a while loop or over-nested, otherwise None.
+    """
+    # Ban continue inside while loops to prevent infinite freezes.
+    if isinstance(node, ast.While) and any(isinstance(child, ast.Continue) for child in ast.walk(node)):
+        return "'continue' inside a while loop banned to prevent infinite freezes"
+    # Only continue statements can be over-nested; a guard here keeps the walk below un-nested.
+    if not isinstance(node, ast.Continue):
+        return None
+    # A continue is over-nested when it sits two or more if/for blocks deep. One 'if' guard directly
+    # inside its loop (the common `for ...: if ...: continue`) is fine; anything deeper is not.
+    blocks: list[str] = []
+    ancestor = getattr(node, "parent", None)
+    while ancestor is not None:
+        if isinstance(ancestor, ast.If | ast.For | ast.While):
+            blocks.append(type(ancestor).__name__)
+        ancestor = getattr(ancestor, "parent", None)
+    # Every continue needs one enclosing loop; a single 'if' above that loop is still fine.
+    if len(blocks) >= 2 and blocks not in (["If", "For"], ["If", "While"]):
+        return "Overly-nested 'continue' detected inside multiple if/for blocks"
+    return None
+
+
+def lazy_any_type_hints(node: ast.AST) -> str | None:
+    """Catch agents using 'Any' to escape strict type checks.
+
+    Args:
+        node: The AST node under inspection.
+
+    Returns:
+        A complaint if the arg is annotated `Any`/`typing.Any`, else None.
+    """
+    if isinstance(node, ast.arg) and node.annotation:
+        item_is_any = isinstance(node.annotation, ast.Name) and node.annotation.id == "Any"  # matches Any
+        uses_typing_dot_any = (
+            isinstance(node.annotation, ast.Attribute)
+            and isinstance(node.annotation.value, ast.Name)
+            and node.annotation.value.id == "typing"
+            and node.annotation.attr == "Any"
+        )  # matches typing.Any
+        if item_is_any or uses_typing_dot_any:
+            return f"Lazy 'Any' type hint detected for argument '{node.arg}'"
+    return None
+
+
+def lambda_found(node: ast.AST) -> str | None:
+    """Catches all lambdas. Ruff E731 only flags lambdas directly assigned to a variable name.
+
+    Args:
+        node: The AST node under inspection.
+
+    Returns:
+        A complaint if the node is a lambda, else None.
+    """
+    if isinstance(node, ast.Lambda):
+        return "Lambda found hurting readability and adding complexity, prefer map() or filter()"
+    return None
+
+
+def named_with_underscore_and_not_in_class_or_dunder(node: ast.AST) -> str | None:
+    """A def, arg, or assignment target starts with '_' and is not in a class object.
+
+    The conventional discard name ``_`` is exempt.
+
+    Args:
+        node: The AST node under inspection.
+
+    Returns:
+        A complaint if the name has a prohibited leading underscore, else None.
+    """
+    if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+        name = node.name
+    elif isinstance(node, ast.arg):
+        name = node.arg
+    elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+        name = node.id
+    else:
+        return None
+    if name.startswith("__") and not name.endswith("__"):
+        return f"Name '{name} starts with a dunder, rename it"
+    if name != "_" and name.startswith("_") and not name.endswith("__") and not is_in_class(node):
+        return f"Name '{name}' starts with underscore and is not in a class"
+
+    return None
+
+
+def hidden_signature_star_args(node: ast.AST) -> str | None:
+    """Reject function definitions that use *args, **kwargs, a bare *, or /.
+
+    Example:
+        def send(*args, **kwargs): ...  -> flagged
+        def send(a, *, b): ...          -> flagged
+        def send(a, /, b): ...          -> flagged
+        def send(a, b): ...             -> fine
+
+    Args:
+        node: One piece of the parsed code to look at.
+
+    Returns:
+        A complaint if the definition uses *args, **kwargs, a bare *, or /, otherwise None.
+    """
+    if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and (
+        node.args.vararg or node.args.kwarg or node.args.kwonlyargs or node.args.posonlyargs
+    ):
+        return "'*args', '**kwargs', '*', and '/' hide the function signature, use explicit parameters"
+    return None
+
+
+def dynamic_star_call(node: ast.AST) -> str | None:
+    """Do not spread a variable in a call's arguments with *, e.g. f(*items).
+
+    When you write f(*items), you can't tell how many arguments f is really getting, and the call breaks
+    if the list is the wrong length. Spreading a list or tuple written out right there, like f(*[1, 2, 3]),
+    is fine because its length is plain to see. A variable, or a list that spreads something else inside
+    it like f(*[1, *items]), is not.
+
+    We only look at '*', not '**'. Keyword unpacking like f(**opts) is a normal, readable Python idiom
+    (passing config through, or super().__init__(**kwargs)), and the one wasteful case, f(**{"a": 1}),
+    is already caught by ruff's PIE804. Positional '*' is the riskier one: the wrong length is a crash.
+
+    Example:
+        f(*items)        -> flagged: 'items' could be any length
+        f(*[1, *items])  -> flagged: the list grows with 'items'
+        f(*[1, 2, 3])    -> fine: exactly three arguments always
+        f(**kwargs)      -> left alone on purpose: keyword unpacking is a normal, readable pattern
+
+    Args:
+        node: One piece of the parsed code to look at.
+
+    Returns:
+        A short message if a * argument is not a plain, fixed-length list or tuple, otherwise None.
+    """
+    if isinstance(node, ast.Call):
+        for arg in node.args:
+            # A '*' spread is fine only on a written-out list/tuple whose length you can see.
+            # A variable, or a literal that spreads something inside (like [1, *more]), hides it.
+            if isinstance(arg, ast.Starred) and not (
+                isinstance(arg.value, ast.List | ast.Tuple)
+                and not any(isinstance(element, ast.Starred) for element in arg.value.elts)
+            ):
+                return "Dynamic '*' call hides positional arguments; pass explicit arguments"
+    return None
+
+
+def pointless_class(node: ast.AST) -> str | None:
+    """A plain class with no base/decorator/keyword and at most one method. Beyond too-few-public-methods
+    R0903 because leaves classes with parents and only attacks bare classes.
+
+    Args:
+        node: The AST node under inspection.
+
+    Returns:
+        A complaint if the node is such a pointless class, else None.
+    """
+    if isinstance(node, ast.ClassDef) and not (node.bases or node.keywords or node.decorator_list):
+        methods = [item for item in node.body if isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef)]
+        if len(methods) <= 1:
+            return f"'{node.name}': no base, decorator, or behavior: use function or Pydantic"
+    return None
+
+
+def lazy_assert(node: ast.AST) -> str | None:
+    """No empty checks or lazy conditions but test nothing.
+    ast.Constant catches True, False, None, 1, 0, 'pass'
+    The others catch literal list/dict/tuple structures like [] or {}
+
+    Args:
+        node: The AST node under inspection.
+
+    Returns:
+        A complaint if the node is a lazy constant/literal assert, else None.
+    """
+    if isinstance(node, ast.Assert) and isinstance(node.test, (ast.Constant, ast.List, ast.Dict, ast.Tuple)):
+        return "Lazy test assertion detected"
+    return None
+
+
+def objects_injected_into_runtime_memory(node: ast.AST) -> str | None:
+    """Check ast.Call nodes to find name calls that manipulate global state.
+    Python keeps internal memory dictionary of each current variable/function. Do not allow calling globals()
+    or locals() to grab/inject variables to runtime (instead of writing e.g. a dict).
+
+    Args:
+        node: The AST node under inspection.
+
+    Returns:
+        A complaint if the node calls globals()/locals(), else None.
+    """
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"globals", "locals"}:
+        return "Dynamic injection of memory registry spotted"
+    return None
+
+
+def complex_comprehension(node: ast.AST) -> str | None:
+    """Use Type Set math or loops when comprehensions become complex.
+
+    Args:
+        node: The AST node under inspection.
+
+    Returns:
+        A complaint if a multi-generator comprehension also filters, else None.
+    """
+    if isinstance(node, ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp) and len(node.generators) > 1:
+        for generator in node.generators:
+            if generator.ifs:
+                return "Overly complex comprehension, use a loop or type Set math"
+    return None
+
+
+# To add a style rule: write a dumb one-node function above and register it here under its kind.
+CHECKS: dict[str, Check] = {
+    "abbreviated_name": abbreviated_name,
+    "named_with_underscore_and_not_in_class_or_dunder": named_with_underscore_and_not_in_class_or_dunder,
+    "hidden_signature_star_args": hidden_signature_star_args,
+    "dynamic_star_call": dynamic_star_call,
+    "pointless_class": pointless_class,
+    "lazy_assert": lazy_assert,
+    "objects_injected_into_runtime_memory": objects_injected_into_runtime_memory,
+    "lambda_found": lambda_found,
+    "lazy_any_type_hints": lazy_any_type_hints,
+    "chaotic_continue_statements": chaotic_continue_statements,
+    "complex_comprehension": complex_comprehension,
+}
+
+
+def preferences_violations(path: str, source: str) -> str:
+    """Run every registered check on one Python file in a single AST walk.
+
+    Args:
+        path: File path used to prefix each violation message.
+        source: Python source text to parse and walk.
+
+    Returns:
+        Violation messages string
+    """
+    violations: list[str] = []
+    tree = ast.parse(source)
+    for parent in ast.walk(tree):  # link each node to its parent so checks can inspect nesting
+        for child in ast.iter_child_nodes(parent):
+            child.__dict__["parent"] = parent  # nodes are parent->child, add parent<-child for nested checks
+    for node in ast.walk(tree):
+        lineno = getattr(node, "lineno", "?")
+        for check in CHECKS.values():
+            message = check(node)
+            if message:
+                violations.append(f"{path}:{lineno}: {message}")
+
+    return "\n".join(violations)

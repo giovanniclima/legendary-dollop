@@ -1,0 +1,66 @@
+name: gate
+
+# Unbypassable backstop. Re-runs the same local checks on every PR and push so nothing merges# without passing all. Branch protection makes this required.
+
+on:
+  pull_request:
+  push:
+    branches: [main, master, prod, production]
+
+env:
+  FORCE_COLOR: "1"
+  CLICOLOR_FORCE: "1"
+  SEMGREP_FORCE_COLOR: "1"
+  TERM: "xterm-256color"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/dependency-review-action@v5  # only works with public repos or paid Github otherwise fail
+        with:
+          # On push there is no PR base/head, so diff the pushed commit range.
+          base-ref: ${{ github.event.pull_request.base.sha || github.event.before }}
+          head-ref: ${{ github.event.pull_request.head.sha || github.event.after }}
+          fail-on-severity: low
+          fail-on-scopes: runtime, development
+          vulnerability-check: true
+          warn-only: false
+
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Go for Vale
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.7"
+          cache: false
+      - name: Install Vale
+        run: |
+          go install github.com/vale-cli/vale/v3/cmd/vale@v3.22.0
+          python -c "import os, subprocess; root = subprocess.check_output(['go', 'env', 'GOPATH'], text=True).strip(); open(os.environ['GITHUB_PATH'], 'a', encoding='utf-8').write(os.path.join(root, 'bin') + os.linesep)"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: uv Sync Dependencies
+        run: uv sync
+
+      - name: Harness Checks
+        run: uv run --no-sync harness gate
